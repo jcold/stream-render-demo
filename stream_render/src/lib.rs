@@ -23,79 +23,118 @@ enum StreamError {
 async fn fetch_stream<T>(
     request: Request,
     set_items: WriteSignal<Vec<T>>,
-    set_error: WriteSignal<Option<StreamError>>,
+    set_error: WriteSignal<Option<Result<(), StreamError>>>,
 ) where
     T: DeserializeOwned,
 {
-    let response = request
-        .send()
-        .await
-        .map_err(|e| StreamError::RequestFailed(e.to_string()))?;
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(e) => {
+            set_error.set(Some(Err(StreamError::RequestFailed(e.to_string()))));
+            return;
+        }
+    };
 
-    let body = response.body().ok_or(StreamError::EmptyResponse)?;
+    let body = match response.body() {
+        Some(body) => body,
+        None => {
+            set_error.set(Some(Err(StreamError::EmptyResponse)));
+            return;
+        }
+    };
 
     let reader = body
         .get_reader()
         .unchecked_into::<web_sys::ReadableStreamDefaultReader>();
 
     loop {
-        let chunk = JsFuture::from(reader.read())
-            .await
-            .map_err(|e| StreamError::ReadError(format_js_error(&e)))?;
+        let chunk = match JsFuture::from(reader.read()).await {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                set_error.set(Some(Err(StreamError::ReadError(format_js_error(&e)))));
+                return;
+            }
+        };
 
         let chunk: js_sys::Object = chunk.unchecked_into();
 
         let done = match js_sys::Reflect::get(&chunk, &"done".into()) {
-            Ok(done) => done.as_bool().ok_or_else(|| {
-                StreamError::ParseError("Failed to convert 'done' to boolean".into())
-            })?,
-            Err(e) => return Err(StreamError::ParseError(format_js_error(&e))),
+            Ok(done) => match done.as_bool() {
+                Some(done) => done,
+                None => {
+                    set_error.set(Some(Err(StreamError::ParseError(
+                        "Failed to convert 'done' to boolean".into(),
+                    ))));
+                    return;
+                }
+            },
+            Err(e) => {
+                set_error.set(Some(Err(StreamError::ParseError(format_js_error(&e)))));
+                return;
+            }
         };
 
         if done {
             break;
         }
 
-        let value = js_sys::Reflect::get(&chunk, &"value".into())
-            .map_err(|e| StreamError::ParseError(format_js_error(&e)))?;
+        let value = match js_sys::Reflect::get(&chunk, &"value".into()) {
+            Ok(value) => value,
+            Err(e) => {
+                set_error.set(Some(Err(StreamError::ParseError(format_js_error(&e)))));
+                return;
+            }
+        };
 
         let value: Uint8Array = value.unchecked_into();
         let value_vec = value.to_vec();
 
-        let text =
-            String::from_utf8(value_vec).map_err(|e| StreamError::ParseError(e.to_string()))?;
+        let text = match String::from_utf8(value_vec) {
+            Ok(text) => text,
+            Err(e) => {
+                set_error.set(Some(Err(StreamError::ParseError(e.to_string()))));
+                return;
+            }
+        };
 
-        let item: T =
-            serde_json::from_str(&text).map_err(|e| StreamError::ParseError(e.to_string()))?;
+        let item: T = match serde_json::from_str(&text) {
+            Ok(item) => item,
+            Err(e) => {
+                set_error.set(Some(Err(StreamError::ParseError(e.to_string()))));
+                return;
+            }
+        };
 
         set_items.update(|items| items.push(item));
     }
+
+    // 常结束时设置 Ok(())
+    set_error.set(Some(Ok(())));
 }
 
 #[component]
 pub fn StreamExample() -> impl IntoView {
     let (items, set_items) = create_signal(Vec::new());
-    let stream_error = create_rw_signal(None::<StreamError>);
+    let stream_error = create_rw_signal(None::<Result<(), StreamError>>);
 
     spawn_local(async move {
-        // 由调用方构造请求
-        let request =
-            Request::get("http://localhost:3000/stream").header("Content-Type", "application/json");
+        let request = Request::get("http://localhost:3000/stream")
+            .header("Content-Type", "application/json")
+            .build()
+            .unwrap();
 
-        fetch_stream::<serde_json::Value>(
-            request.build().unwrap(),
-            set_items,
-            stream_error.write_only(),
-        )
-        .await;
+        fetch_stream::<serde_json::Value>(request, set_items, stream_error.write_only()).await;
     });
 
     view! {
         <h1>"Stream Render Example"</h1>
-        {move || stream_error.get().map(|err| view! {
-            <div class="error">
-                "Error: " {move || err.to_string()}
-            </div>
+        {move || stream_error.get().map(|result| match result {
+            Ok(_) => view! { <div class="success">"Stream completed successfully"</div> },
+            Err(err) => view! {
+                <div class="error">
+                    "Error: " {err.to_string()}
+                </div>
+            }
         })}
         <ul>
             {move || items.get().iter().map(|item| view! {
