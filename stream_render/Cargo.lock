@@ -247,6 +247,7 @@ dependencies = [
  "js-sys",
  "leptos",
  "log",
+ "thiserror",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
