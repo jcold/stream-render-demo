@@ -1,6 +1,7 @@
 use gloo::net::http::Request;
 use js_sys::Uint8Array;
 use leptos::*;
+use serde::de::DeserializeOwned;
 use thiserror::Error;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -19,84 +20,74 @@ enum StreamError {
     ParseError(String),
 }
 
+async fn fetch_stream<T>(
+    request: Request,
+    set_items: WriteSignal<Vec<T>>,
+    set_error: WriteSignal<Option<StreamError>>,
+) where
+    T: DeserializeOwned,
+{
+    let response = request
+        .send()
+        .await
+        .map_err(|e| StreamError::RequestFailed(e.to_string()))?;
+
+    let body = response.body().ok_or(StreamError::EmptyResponse)?;
+
+    let reader = body
+        .get_reader()
+        .unchecked_into::<web_sys::ReadableStreamDefaultReader>();
+
+    loop {
+        let chunk = JsFuture::from(reader.read())
+            .await
+            .map_err(|e| StreamError::ReadError(format_js_error(&e)))?;
+
+        let chunk: js_sys::Object = chunk.unchecked_into();
+
+        let done = match js_sys::Reflect::get(&chunk, &"done".into()) {
+            Ok(done) => done.as_bool().ok_or_else(|| {
+                StreamError::ParseError("Failed to convert 'done' to boolean".into())
+            })?,
+            Err(e) => return Err(StreamError::ParseError(format_js_error(&e))),
+        };
+
+        if done {
+            break;
+        }
+
+        let value = js_sys::Reflect::get(&chunk, &"value".into())
+            .map_err(|e| StreamError::ParseError(format_js_error(&e)))?;
+
+        let value: Uint8Array = value.unchecked_into();
+        let value_vec = value.to_vec();
+
+        let text =
+            String::from_utf8(value_vec).map_err(|e| StreamError::ParseError(e.to_string()))?;
+
+        let item: T =
+            serde_json::from_str(&text).map_err(|e| StreamError::ParseError(e.to_string()))?;
+
+        set_items.update(|items| items.push(item));
+    }
+}
+
 #[component]
 pub fn StreamExample() -> impl IntoView {
     let (items, set_items) = create_signal(Vec::new());
     let stream_error = create_rw_signal(None::<StreamError>);
 
     spawn_local(async move {
-        let response = match Request::get("http://localhost:3000/stream").send().await {
-            Ok(response) => response,
-            Err(e) => {
-                stream_error.set(Some(StreamError::RequestFailed(e.to_string())));
-                return;
-            }
-        };
+        // 由调用方构造请求
+        let request =
+            Request::get("http://localhost:3000/stream").header("Content-Type", "application/json");
 
-        let body = match response.body() {
-            Some(body) => body,
-            None => {
-                stream_error.set(Some(StreamError::EmptyResponse));
-                return;
-            }
-        };
-
-        let reader = body
-            .get_reader()
-            .unchecked_into::<web_sys::ReadableStreamDefaultReader>();
-
-        loop {
-            let chunk = match JsFuture::from(reader.read()).await {
-                Ok(chunk) => chunk,
-                Err(e) => {
-                    stream_error.set(Some(StreamError::ReadError(format_js_error(&e))));
-                    break;
-                }
-            };
-
-            let chunk: js_sys::Object = chunk.unchecked_into();
-
-            let done = match js_sys::Reflect::get(&chunk, &"done".into()) {
-                Ok(done) => match done.as_bool() {
-                    Some(done) => done,
-                    None => {
-                        stream_error.set(Some(StreamError::ParseError(
-                            "Failed to convert 'done' to boolean".into(),
-                        )));
-                        break;
-                    }
-                },
-                Err(e) => {
-                    stream_error.set(Some(StreamError::ParseError(format_js_error(&e))));
-                    break;
-                }
-            };
-
-            if done {
-                break;
-            }
-
-            let value = match js_sys::Reflect::get(&chunk, &"value".into()) {
-                Ok(value) => value,
-                Err(e) => {
-                    stream_error.set(Some(StreamError::ParseError(format_js_error(&e))));
-                    continue;
-                }
-            };
-
-            let value: Uint8Array = value.unchecked_into();
-            let value_vec = value.to_vec();
-
-            let text = match String::from_utf8(value_vec) {
-                Ok(text) => text,
-                Err(e) => {
-                    stream_error.set(Some(StreamError::ParseError(e.to_string())));
-                    continue;
-                }
-            };
-
-            set_items.update(|items| items.push(text));
-        }
+        fetch_stream::<serde_json::Value>(
+            request.build().unwrap(),
+            set_items,
+            stream_error.write_only(),
+        )
+        .await;
     });
 
     view! {
@@ -108,7 +99,7 @@ pub fn StreamExample() -> impl IntoView {
         })}
         <ul>
             {move || items.get().iter().map(|item| view! {
-                <li>{item}</li>
+                <li>{serde_json::to_string_pretty(item).unwrap_or_else(|_| "Invalid JSON".into())}</li>
             }).collect_view()}
         </ul>
     }
